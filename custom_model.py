@@ -141,12 +141,14 @@ class CustomGenerativeModel(BaseGenerativeModel):
         # Sample time and noise
         t = self.scheduler.sample_timesteps(B, device)
         t = t.to(data.dtype)
-        eps = torch.randn_like(data)
+        eps = torch.randn_like(data, memory_format=torch.channels_last)
         # Forward process and velocity target
         xt = self.scheduler.forward_process(data, eps, t)
+        xt = xt.contiguous(memory_format=torch.channels_last)
         target_v = self.scheduler.get_target(data, eps, t)
         # Predict velocity
         pred_v = self.predict(xt, t)
+        pred_v = pred_v.contiguous(memory_format=torch.channels_last)
         vel_loss = F.mse_loss(pred_v, target_v)
 
         # Optional LPIPS on reconstructed x0
@@ -160,8 +162,11 @@ class CustomGenerativeModel(BaseGenerativeModel):
             # Reconstruct x0_hat = x_t - t * v_theta(x_t, t)
             t_broadcast = t.view(-1, 1, 1, 1)
             x0_hat = xt - t_broadcast * pred_v
-            # LPIPS expects [-1,1] range; data already in [-1,1]
-            lp = self._lpips_net(x0_hat, data)
+            # LPIPS prefers float32; cast if model/data are bf16
+            x0_lp = x0_hat.float()
+            data_lp = data.float()
+            with torch.no_grad():
+                lp = self._lpips_net(x0_lp, data_lp)
             lp_loss = lp.mean()
             total_loss = total_loss + self.lpips_weight * lp_loss
 
@@ -181,6 +186,9 @@ class CustomGenerativeModel(BaseGenerativeModel):
         """
         # Network predicts velocity v_theta(xt, t)
         condition = kwargs.get('condition', None)
+        if t.dtype != xt.dtype:
+            t = t.to(dtype=xt.dtype)
+        xt = xt.contiguous(memory_format=torch.channels_last)
         if self.use_checkpoint and xt.requires_grad:
             return _checkpoint(lambda a, b, c: self.network(a, b, c), xt, t, condition)
         return self.network(xt, t, condition)
@@ -202,6 +210,7 @@ class CustomGenerativeModel(BaseGenerativeModel):
         device = self.device
         B = shape[0]
         x = torch.randn(shape, device=device)
+        x = x.contiguous(memory_format=torch.channels_last)
         traj = [x.clone()] if return_traj else None
 
         def heun_step(x_in, t_i, t_j):
@@ -209,8 +218,10 @@ class CustomGenerativeModel(BaseGenerativeModel):
             t_i_tensor = torch.full((B,), float(t_i), device=device, dtype=x_in.dtype)
             t_j_tensor = torch.full((B,), float(t_j), device=device, dtype=x_in.dtype)
             k1 = self.predict(x_in, t_i_tensor)
+            k1 = k1.contiguous(memory_format=torch.channels_last)
             x_euler = self.scheduler.reverse_process_step(x_in, k1, t_i_tensor, t_j_tensor)
             k2 = self.predict(x_euler, t_j_tensor)
+            k2 = k2.contiguous(memory_format=torch.channels_last)
             dt = (t_i - t_j)
             x_in.sub_(0.5 * dt * (k1 + k2))
             return x_in
@@ -243,6 +254,7 @@ class CustomGenerativeModel(BaseGenerativeModel):
                 t_i = torch.full((B,), float(t_grid[i].item()), device=device, dtype=x.dtype)
                 t_j = torch.full((B,), float(t_grid[i+1].item()), device=device, dtype=x.dtype)
                 k1 = self.predict(x, t_i)
+                k1 = k1.contiguous(memory_format=torch.channels_last)
                 x = self.scheduler.reverse_process_step(x, k1, t_i, t_j)
                 if return_traj:
                     traj.append(x.clone())
