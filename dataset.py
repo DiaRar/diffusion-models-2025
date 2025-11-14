@@ -39,16 +39,32 @@ def get_data_iterator(iterable):
             iterator = iterable.__iter__()
 
 class SimpsonsDataset(torch.utils.data.Dataset):
-    def __init__(self, root, split, transform=None):
+    def __init__(self, root, split, transform=None, cache=False, pin_memory_cache=False):
         super().__init__()
         self.root = root
         self.split = split
         self.transform = transform
+        self.cache_enabled = bool(cache)
+        self.pin_memory_cache = bool(pin_memory_cache)
 
         with open(os.path.join("data", f"{split}_split.txt"), "r") as f:
             self.image_paths = [os.path.join(root, f.strip()+".png") for f in f.readlines()]
 
+        self._cache_data = None
+        if self.cache_enabled:
+            cached = []
+            for path in self.image_paths:
+                img = Image.open(path).convert("RGB")
+                if self.transform is not None:
+                    img = self.transform(img)
+                if self.pin_memory_cache and isinstance(img, torch.Tensor):
+                    img = img.pin_memory()
+                cached.append(img)
+            self._cache_data = cached
+
     def __getitem__(self, idx):
+        if self._cache_data is not None:
+            return self._cache_data[idx]
         path = self.image_paths[idx]
         img = Image.open(path).convert("RGB")
         if self.transform is not None:
@@ -59,12 +75,14 @@ class SimpsonsDataset(torch.utils.data.Dataset):
         return len(self.image_paths)
 
 class SimpsonsDataModule(object):
-    def __init__(self, root="./data/datasets/kostastokis/simpsons-faces/versions/1/cropped", batch_size=32, num_workers=4, transform=None):
+    def __init__(self, root="./data/datasets/kostastokis/simpsons-faces/versions/1/cropped", batch_size=32, num_workers=4, transform=None, cache=False, pin_memory_cache=False):
         self.root = root
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.transform = transform
         self.image_resolution = 64
+        self.cache = bool(cache)
+        self.pin_memory_cache = bool(pin_memory_cache)
 
         if not os.path.exists(self.root):
             self._download_dataset(dir_path=self.root)
@@ -79,8 +97,8 @@ class SimpsonsDataModule(object):
                     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
                 ]
             )
-        self.train_ds = SimpsonsDataset(self.root, "train", self.transform)
-        self.val_ds = SimpsonsDataset(self.root, "val", self.transform)
+        self.train_ds = SimpsonsDataset(self.root, "train", self.transform, cache=self.cache, pin_memory_cache=self.pin_memory_cache)
+        self.val_ds = SimpsonsDataset(self.root, "val", self.transform, cache=self.cache, pin_memory_cache=self.pin_memory_cache)
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True, drop_last=True)

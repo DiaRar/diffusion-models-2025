@@ -34,6 +34,7 @@ def train_model(
     model_config=None,
     use_ema=False,
     ema_decay=0.999,
+    plot_interval=None,
 ):
     """
     Train a generative model.
@@ -101,16 +102,18 @@ def train_model(
     
     pbar = tqdm(range(num_iterations), desc="Training")
     
+    # Pre-compute device flags
+    is_xla = (getattr(device, 'type', '') == 'xla') or ('xla' in str(device))
+    is_cuda = str(device) == "cuda"
     for iteration in pbar:
         # Get batch from infinite iterator
         data = next(train_iterator)
         data = data.contiguous(memory_format=torch.channels_last).to(device, non_blocking=True)
         try:
-            is_xla = (getattr(device, 'type', '') == 'xla') or ('xla' in str(device))
             if is_xla:
                 loss = model.compute_loss(data, None)
             else:
-                with torch.cuda.amp.autocast(enabled=str(device) == "cuda"):
+                with torch.cuda.amp.autocast(enabled=is_cuda):
                     loss = model.compute_loss(data, None)
         except NotImplementedError:
             print("Error: compute_loss method not implemented!")
@@ -120,7 +123,6 @@ def train_model(
             print(f"Error computing loss: {e}")
             return
         
-        is_xla = (getattr(device, 'type', '') == 'xla') or ('xla' in str(device))
         optimizer.zero_grad(set_to_none=True)
         if is_xla:
             import torch_xla.core.xla_model as xm
@@ -133,8 +135,12 @@ def train_model(
             scaler.update()
         
         if ema_enabled:
-            for ema_p, p in zip(ema_params, model.network.parameters()):
-                ema_p.mul_(ema_decay).add_(p.detach(), alpha=1 - ema_decay)
+            try:
+                torch._foreach_mul_(ema_params, ema_decay)
+                torch._foreach_add_(ema_params, [p.detach() for p in model.network.parameters()], alpha=1 - ema_decay)
+            except Exception:
+                for ema_p, p in zip(ema_params, model.network.parameters()):
+                    ema_p.mul_(ema_decay).add_(p.detach(), alpha=1 - ema_decay)
         
         train_losses.append(loss.item())
         
@@ -165,19 +171,24 @@ def train_model(
                 except Exception as e:
                     print(f"Warning: Failed to save best model: {e}")
             
-            # Save training loss curve
-            try:
-                plt.figure(figsize=(10, 6))
-                plt.plot(train_losses)
-                plt.xlabel('Iteration')
-                plt.ylabel('Loss')
-                plt.title('Training Loss')
-                plt.grid(True)
-                plt.tight_layout()
-                plt.savefig(save_dir / "training_curves.png", dpi=150, bbox_inches='tight')
-                plt.close()
-            except Exception as e:
-                print(f"Warning: Could not save training curve: {e}")
+            # Save training loss curve at configured interval (defaults to save_interval)
+            if plot_interval is None:
+                plot_iv = save_interval
+            else:
+                plot_iv = plot_interval
+            if (iteration + 1) % plot_iv == 0:
+                try:
+                    plt.figure(figsize=(10, 6))
+                    plt.plot(train_losses)
+                    plt.xlabel('Iteration')
+                    plt.ylabel('Loss')
+                    plt.title('Training Loss')
+                    plt.grid(True)
+                    plt.tight_layout()
+                    plt.savefig(save_dir / "training_curves.png", dpi=150, bbox_inches='tight')
+                    plt.close()
+                except Exception as e:
+                    print(f"Warning: Could not save training curve: {e}")
         
         if (iteration + 1) % save_interval == 0:
             checkpoint_path = save_dir / f"checkpoint_iter_{iteration+1}.pt"
@@ -342,18 +353,40 @@ def main(args):
         **model_kwargs  # Include all custom model arguments
     }
     
+    # Optional channels_last for model on CUDA
+    try:
+        if str(device) == "cuda" and bool(getattr(args, 'channels_last', True)):
+            model.network = model.network.to(memory_format=torch.channels_last)
+            for p in model.network.parameters():
+                p.data = p.data.contiguous(memory_format=torch.channels_last)
+    except Exception:
+        pass
+
     # Load dataset
     print("Loading dataset...")
     try:
         data_module = SimpsonsDataModule(
             batch_size=args.batch_size,
-            num_workers=4
+            num_workers=(args.num_workers if args.num_workers is not None else 4),
+            cache=bool(getattr(args, 'cache_dataset', False)),
+            pin_memory_cache=bool(getattr(args, 'pin_memory', True) and str(device) == "cuda")
         )
         
         base_loader = data_module.train_dataloader()
         try:
-            loader_kwargs = {"pin_memory": (False if use_tpu else True), "persistent_workers": True, "prefetch_factor": 4, "shuffle": True, "drop_last": True}
-            train_loader = torch.utils.data.DataLoader(data_module.train_ds, batch_size=args.batch_size, num_workers=4, **loader_kwargs)
+            loader_kwargs = {
+                "pin_memory": (False if use_tpu else bool(getattr(args, 'pin_memory', True))),
+                "persistent_workers": bool(getattr(args, 'persistent_workers', True)),
+                "prefetch_factor": int(getattr(args, 'prefetch_factor', 4)),
+                "shuffle": True,
+                "drop_last": True,
+            }
+            train_loader = torch.utils.data.DataLoader(
+                data_module.train_ds,
+                batch_size=args.batch_size,
+                num_workers=(args.num_workers if args.num_workers is not None else 4),
+                **loader_kwargs,
+            )
         except Exception:
             train_loader = base_loader
         if use_tpu:
@@ -379,7 +412,10 @@ def main(args):
         device=device,
         log_interval=args.log_interval,
         save_interval=args.save_interval,
-        model_config=model_config
+        model_config=model_config,
+        use_ema=bool(getattr(args, 'use_ema', False)),
+        ema_decay=float(getattr(args, 'ema_decay', 0.999)),
+        plot_interval=getattr(args, 'plot_interval', None),
     )
 
 
@@ -419,6 +455,23 @@ if __name__ == "__main__":
                        help="Enable EMA for model parameters")
     parser.add_argument("--ema_decay", type=float, default=0.999,
                        help="EMA decay factor")
+    # Performance-related toggles
+    parser.add_argument("--compile", action="store_true", default=True,
+                       help="Compile model with torch.compile for speed")
+    parser.add_argument("--channels_last", action="store_true", default=True,
+                       help="Use channels_last memory format on CUDA")
+    parser.add_argument("--num_workers", type=int, default=None,
+                       help="Number of DataLoader workers (default: CPU count)")
+    parser.add_argument("--prefetch_factor", type=int, default=4,
+                       help="DataLoader prefetch factor (items per worker)")
+    parser.add_argument("--persistent_workers", action="store_true",
+                       help="Keep DataLoader workers alive for faster epochs")
+    parser.add_argument("--pin_memory", action="store_true",
+                       help="Pin host memory for faster H2D copies on CUDA")
+    parser.add_argument("--cache_dataset", action="store_true",
+                       help="Cache and pre-transform dataset in memory for speed")
+    parser.add_argument("--plot_interval", type=int, default=None,
+                       help="Iterations between plotting loss curve (default: save_interval)")
     
     # Students can add their own custom arguments below for their implementation
     # For example:
@@ -427,5 +480,11 @@ if __name__ == "__main__":
     # etc.
     
     args = parser.parse_args()
+    # Defaults for performance flags if not explicitly set
+    if args.num_workers is None:
+        try:
+            args.num_workers = max(4, os.cpu_count() or 4)
+        except Exception:
+            args.num_workers = 4
 
     main(args)
