@@ -76,7 +76,17 @@ def save_model(model, checkpoint_path: str, model_config: Dict[str, Any], config
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Save model state dict
-    torch.save({"state_dict": model.state_dict()}, checkpoint_path)
+    use_xla = False
+    try:
+        import torch_xla.core.xla_model as xm
+        use_xla = any(p.device.type == 'xla' for p in model.parameters())
+    except Exception:
+        use_xla = False
+    if use_xla:
+        import torch_xla.core.xla_model as xm
+        xm.save({"state_dict": model.state_dict()}, str(checkpoint_path))
+    else:
+        torch.save({"state_dict": model.state_dict()}, checkpoint_path)
     
     # Save model config JSON
     if config_path is None:
@@ -122,7 +132,7 @@ def load_model(checkpoint_path: str, create_model_fn, device: str = "cpu", confi
     model = create_model_fn(device=device, **model_kwargs)
     
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     if "state_dict" in checkpoint:
         model.load_state_dict(checkpoint["state_dict"])
     else:

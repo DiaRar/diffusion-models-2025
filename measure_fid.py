@@ -122,6 +122,10 @@ def main():
             reference_dir=args.reference_dir,
             num_samples=None
         )
+    if not os.path.isdir(args.reference_dir):
+        raise ValueError(f"Invalid reference directory: {args.reference_dir}")
+    if not any(Path(args.reference_dir).glob("*.png")):
+        raise RuntimeError("Reference directory contains no images")
     
     print(f"\n{'='*60}")
     print(f"Computing FID")

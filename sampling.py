@@ -20,8 +20,21 @@ def main(args):
     
     save_dir = Path(args.save_dir)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    use_tpu = False
+    if str(args.device).lower() == "tpu":
+        try:
+            import torch_xla.core.xla_model as xm
+            use_tpu = True
+            device = xm.xla_device()
+            print(f"Using XLA device: {device}")
+        except Exception as e:
+            raise RuntimeError(f"TPU requested but torch_xla is unavailable: {e}")
     
     # Load model
+    if not Path(args.ckpt_path).exists():
+        raise FileNotFoundError(f"Checkpoint not found: {args.ckpt_path}")
+    if any(nfe <= 0 for nfe in args.nfe_list):
+        raise ValueError("All NFE values must be positive integers")
     print(f"Loading model from: {args.ckpt_path}")
     model = load_model(args.ckpt_path, create_custom_model, str(device), args.config_path)
     model.eval()
@@ -48,7 +61,10 @@ def main(args):
             # Save images
             pil_images = tensor_to_pil_image(samples)
             for j, img in zip(range(sidx, eidx), pil_images):
-                img.save(nfe_dir / f"{j:04d}.png")
+                try:
+                    img.save(nfe_dir / f"{j:04d}.png")
+                except Exception:
+                    pass
         
         print(f"✓ Saved to {nfe_dir}")
     

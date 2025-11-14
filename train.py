@@ -30,7 +30,9 @@ def train_model(
     device="cpu",
     log_interval=500,
     save_interval=10000,
-    model_config=None
+    model_config=None,
+    use_ema=False,
+    ema_decay=0.999,
 ):
     """
     Train a generative model.
@@ -52,7 +54,18 @@ def train_model(
     save_dir.mkdir(exist_ok=True, parents=True)
     
     # Create optimizer
-    optimizer = optim.Adam(model.network.parameters(), lr=lr)
+    if str(device) == "cuda":
+        try:
+            optimizer = optim.AdamW(model.network.parameters(), lr=lr, fused=True)
+        except Exception:
+            optimizer = optim.AdamW(model.network.parameters(), lr=lr)
+    else:
+        optimizer = optim.Adam(model.network.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=str(device) == "cuda")
+    ema_enabled = bool(use_ema)
+    ema_params = None
+    if ema_enabled:
+        ema_params = [p.detach().clone() for p in model.network.parameters()]
     
     # Save training configuration
     config = {
@@ -68,6 +81,11 @@ def train_model(
     
     # Training loop
     train_losses = []
+    # Track best loss (rolling average) for saving a compliant best checkpoint
+    best_metric = float("inf")
+    best_iter = 0
+    checkpoints_dir = Path("./checkpoints")
+    checkpoints_dir.mkdir(exist_ok=True, parents=True)
     
     print(f"Starting training for {num_iterations} iterations...")
     print(f"Model: {type(model).__name__}")
@@ -81,14 +99,14 @@ def train_model(
     for iteration in pbar:
         # Get batch from infinite iterator
         data = next(train_iterator)
-        data = data.to(device)
-        
-        # Generate noise
-        noise = data.clone()
-        
-        # Compute loss
+        data = data.contiguous(memory_format=torch.channels_last).to(device, non_blocking=True)
         try:
-            loss = model.compute_loss(data, noise)
+            is_xla = (getattr(device, 'type', '') == 'xla') or ('xla' in str(device))
+            if is_xla:
+                loss = model.compute_loss(data, None)
+            else:
+                with torch.cuda.amp.autocast(enabled=str(device) == "cuda"):
+                    loss = model.compute_loss(data, None)
         except NotImplementedError:
             print("Error: compute_loss method not implemented!")
             print("Please implement the compute_loss method in your model class.")
@@ -97,10 +115,21 @@ def train_model(
             print(f"Error computing loss: {e}")
             return
         
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        is_xla = (getattr(device, 'type', '') == 'xla') or ('xla' in str(device))
+        optimizer.zero_grad(set_to_none=True)
+        if is_xla:
+            import torch_xla.core.xla_model as xm
+            loss.backward()
+            xm.optimizer_step(optimizer, barrier=True)
+            xm.mark_step()
+        else:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        
+        if ema_enabled:
+            for ema_p, p in zip(ema_params, model.network.parameters()):
+                ema_p.mul_(ema_decay).add_(p.detach(), alpha=1 - ema_decay)
         
         train_losses.append(loss.item())
         
@@ -111,6 +140,25 @@ def train_model(
         if (iteration + 1) % log_interval == 0:
             avg_loss = sum(train_losses[-log_interval:]) / min(log_interval, len(train_losses))
             print(f"Iteration {iteration+1}/{num_iterations}, Loss: {loss.item():.4f}, Avg Loss: {avg_loss:.4f}")
+
+            if avg_loss < best_metric:
+                best_metric = avg_loss
+                best_iter = iteration + 1
+                best_path = checkpoints_dir / "best_model.pt"
+                try:
+                    if ema_enabled:
+                        original = [p.detach().clone() for p in model.network.parameters()]
+                        for p, ema_p in zip(model.network.parameters(), ema_params):
+                            p.data.copy_(ema_p)
+                        save_model(model, str(best_path), model_config)
+                        for p, orig in zip(model.network.parameters(), original):
+                            p.data.copy_(orig)
+                    else:
+                        save_model(model, str(best_path), model_config)
+                    print(f"  New best avg loss {best_metric:.4f} at iter {best_iter}. Saved: {best_path}")
+                    print(f"  Config saved: {best_path.parent / 'model_config.json'}")
+                except Exception as e:
+                    print(f"Warning: Failed to save best model: {e}")
             
             # Save training loss curve
             try:
@@ -127,30 +175,80 @@ def train_model(
                 print(f"Warning: Could not save training curve: {e}")
         
         if (iteration + 1) % save_interval == 0:
-            # Save checkpoint
             checkpoint_path = save_dir / f"checkpoint_iter_{iteration+1}.pt"
-            save_model(model, str(checkpoint_path), model_config)
-            print(f"\n  Checkpoint saved: {checkpoint_path}")
-            print(f"  Config saved: {checkpoint_path.parent / 'model_config.json'}")
+            try:
+                if ema_enabled:
+                    original = [p.detach().clone() for p in model.network.parameters()]
+                    for p, ema_p in zip(model.network.parameters(), ema_params):
+                        p.data.copy_(ema_p)
+                    save_model(model, str(checkpoint_path), model_config)
+                    last_ckpt = save_dir / "last.ckpt"
+                    save_model(model, str(last_ckpt), model_config)
+                    for p, orig in zip(model.network.parameters(), original):
+                        p.data.copy_(orig)
+                else:
+                    save_model(model, str(checkpoint_path), model_config)
+                    last_ckpt = save_dir / "last.ckpt"
+                    save_model(model, str(last_ckpt), model_config)
+                print(f"\n  Checkpoint saved: {checkpoint_path}")
+                print(f"  Last checkpoint saved: {last_ckpt}")
+                print(f"  Config saved: {checkpoint_path.parent / 'model_config.json'}")
+            except Exception as e:
+                print(f"Warning: Failed to save checkpoint: {e}")
         
-            # Generate samples
             print("\n  Generating samples...")
             model.eval()
             shape = (4, 3, 64, 64)
-            samples = model.sample(shape, 
-                                    num_inference_timesteps=20)
+            with torch.no_grad():
+                samples = model.sample(
+                    shape,
+                    num_inference_timesteps=20
+                )
             model.train()
             
             # Save samples
             pil_images = tensor_to_pil_image(samples)
             for i, img in enumerate(pil_images):
                 img.save(save_dir / f"iter={iteration+1}_sample_{i}.png")
-                
+        
     # Save final model
     final_path = save_dir / "final_model.pt"
+    # Ensure a compliant best checkpoint exists even if no log interval triggered
     try:
-        save_model(model, str(final_path), model_config)
+        if best_metric == float("inf") and len(train_losses) > 0:
+            overall_avg = sum(train_losses) / len(train_losses)
+            best_metric = overall_avg
+            best_iter = len(train_losses)
+            best_path = Path("./checkpoints") / "best_model.pt"
+            if ema_enabled:
+                original = [p.detach().clone() for p in model.network.parameters()]
+                for p, ema_p in zip(model.network.parameters(), ema_params):
+                    p.data.copy_(ema_p)
+                save_model(model, str(best_path), model_config)
+                for p, orig in zip(model.network.parameters(), original):
+                    p.data.copy_(orig)
+            else:
+                save_model(model, str(best_path), model_config)
+            print(f"Saved best model at end (avg {best_metric:.4f}, iter {best_iter}): {best_path}")
+            print(f"Config saved: {best_path.parent / 'model_config.json'}")
+    except Exception as e:
+        print(f"Warning: Could not save fallback best model: {e}")
+    try:
+        if ema_enabled:
+            original = [p.detach().clone() for p in model.network.parameters()]
+            for p, ema_p in zip(model.network.parameters(), ema_params):
+                p.data.copy_(ema_p)
+            save_model(model, str(final_path), model_config)
+            last_ckpt = Path(save_dir) / "last.ckpt"
+            save_model(model, str(last_ckpt), model_config)
+            for p, orig in zip(model.network.parameters(), original):
+                p.data.copy_(orig)
+        else:
+            save_model(model, str(final_path), model_config)
+            last_ckpt = Path(save_dir) / "last.ckpt"
+            save_model(model, str(last_ckpt), model_config)
         print(f"Final model saved: {final_path}")
+        print(f"Last checkpoint saved: {last_ckpt}")
         print(f"Config saved: {final_path.parent / 'model_config.json'}")
     except Exception as e:
         print(f"Error saving final model: {e}")
@@ -171,6 +269,25 @@ def main(args):
     # Set device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    use_tpu = False
+    if str(args.device).lower() == "tpu":
+        try:
+            import torch_xla.core.xla_model as xm
+            use_tpu = True
+            device = xm.xla_device()
+            print(f"Using XLA device: {device}")
+        except Exception as e:
+            print(f"TPU requested but torch_xla is unavailable: {e}")
+            return
+    try:
+        import torch.backends.cuda as cuda_backends
+        cuda_backends.matmul.allow_tf32 = True
+        import torch.backends.cudnn as cudnn
+        cudnn.allow_tf32 = True
+        cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
+    except Exception:
+        pass
     
     # Create model
     print("Creating model...")
@@ -218,8 +335,19 @@ def main(args):
             num_workers=4
         )
         
-        train_loader = data_module.train_dataloader()
-        train_iterator = get_data_iterator(train_loader)
+        base_loader = data_module.train_dataloader()
+        try:
+            loader_kwargs = {"pin_memory": True, "persistent_workers": True, "prefetch_factor": 4, "shuffle": True, "drop_last": True}
+            train_loader = torch.utils.data.DataLoader(data_module.train_ds, batch_size=args.batch_size, num_workers=4, **loader_kwargs)
+        except Exception:
+            train_loader = base_loader
+        if use_tpu:
+            import torch_xla.distributed.parallel_loader as pl
+            ploader = pl.ParallelLoader(train_loader, [device])
+            per_dev_loader = ploader.per_device_loader(device)
+            train_iterator = get_data_iterator(per_dev_loader)
+        else:
+            train_iterator = get_data_iterator(train_loader)
         
         print(f"Total iterations: {args.num_iterations}")
     except Exception as e:
@@ -266,6 +394,16 @@ if __name__ == "__main__":
                        help="Use additional condition embedding in U-Net (e.g., step size for Shortcut Models or end timestep for Consistency Trajectory Models)")
     parser.add_argument("--num_train_timesteps", type=int, default=1000,
                        help="Number of training timesteps for scheduler")
+    
+    # Optional perceptual loss
+    parser.add_argument("--use_lpips", action="store_true",
+                       help="Enable LPIPS perceptual loss on reconstructed x0 (default: disabled)")
+    parser.add_argument("--lpips_weight", type=float, default=0.0,
+                       help="Weight for LPIPS loss term (default: 0.0)")
+    parser.add_argument("--use_ema", action="store_true",
+                       help="Enable EMA for model parameters")
+    parser.add_argument("--ema_decay", type=float, default=0.999,
+                       help="EMA decay factor")
     
     # Students can add their own custom arguments below for their implementation
     # For example:

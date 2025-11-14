@@ -16,6 +16,7 @@ venv/
 env/
 ENV/
 .venv
+image_gen/
 .conda/
 conda-meta/
 
@@ -76,4 +77,5 @@ Thumbs.db
 # Misc
 *.bak
 *.orig
-
+.trae/
+checkpoints/
