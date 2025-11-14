@@ -562,7 +562,7 @@ def main(args):
             os.environ.setdefault('TPU_NUM_DEVICES', nprocs_env)
         except Exception:
             pass
-        nprocs = int(getattr(args, 'xla_num_cores', 8))
+        nprocs = None
         try:
             xmp.spawn(tpu_worker_entry, args=(args,), nprocs=nprocs, start_method='spawn')
         except Exception as e:
