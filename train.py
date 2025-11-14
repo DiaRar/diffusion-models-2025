@@ -134,6 +134,7 @@ def train_model(
     pbar = tqdm(range(num_iterations), desc="Training") if is_master else range(num_iterations)
     
     for iteration in pbar:
+        optimizer.zero_grad(set_to_none=True)
         # Get batch from infinite iterator
         data = next(train_iterator)
         data = data.contiguous(memory_format=torch.channels_last).to(device, non_blocking=True)
@@ -168,12 +169,10 @@ def train_model(
             print(f"Error computing loss: {e}")
             return
         
-        optimizer.zero_grad(set_to_none=True)
         if is_xla:
             import torch_xla.core.xla_model as xm
-            import torch_xla as tx
             xm.optimizer_step(optimizer, barrier=True)
-            tx.sync()
+            xm.mark_step()
         else:
             scaler.step(optimizer)
             scaler.update()
@@ -198,7 +197,7 @@ def train_model(
         # Logging and save loss curve (only master for XLA)
         if is_master and (iteration + 1) % log_interval == 0:
             avg_loss = sum(train_losses[-log_interval:]) / min(log_interval, len(train_losses))
-            print(f"Iteration {iteration+1}/{num_iterations}, Loss: {loss.item():.4f}, Avg Loss: {avg_loss:.4f}")
+            print(f"Iteration {iteration+1}/{num_iterations}, Loss: {loss_val:.4f}, Avg Loss: {avg_loss:.4f}")
 
             if avg_loss < best_metric:
                 best_metric = avg_loss
