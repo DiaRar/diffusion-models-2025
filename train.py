@@ -55,6 +55,7 @@ def train_model(
     ema_decay=0.999,
     plot_interval=None,
     xla_bf16=False,
+    grad_accum_steps=1,
 ):
     """
     Train a generative model.
@@ -142,11 +143,23 @@ def train_model(
             except Exception:
                 pass
         try:
-            if is_xla:
-                loss = model.compute_loss(data, None)
+            chunks = max(int(grad_accum_steps), 1)
+            if chunks > 1:
+                data_parts = torch.chunk(data, chunks, dim=0)
             else:
-                with torch.amp.autocast('cuda', enabled=is_cuda):
-                    loss = model.compute_loss(data, None)
+                data_parts = (data,)
+            loss_val = 0.0
+            if is_xla:
+                for dp in data_parts:
+                    l = model.compute_loss(dp, None)
+                    loss_val += float(l.item())
+                    (l / float(chunks)).backward()
+            else:
+                for dp in data_parts:
+                    with torch.amp.autocast('cuda', enabled=is_cuda):
+                        l = model.compute_loss(dp, None)
+                    loss_val += float(l.item())
+                    scaler.scale(l / float(chunks)).backward()
         except NotImplementedError:
             print("Error: compute_loss method not implemented!")
             print("Please implement the compute_loss method in your model class.")
@@ -159,11 +172,9 @@ def train_model(
         if is_xla:
             import torch_xla.core.xla_model as xm
             import torch_xla as tx
-            loss.backward()
             xm.optimizer_step(optimizer, barrier=True)
             tx.sync()
         else:
-            scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         
@@ -179,10 +190,10 @@ def train_model(
                     for ema_p, p in zip(ema_params, model.network.parameters()):
                         ema_p.mul_(ema_decay).add_(p.detach(), alpha=1 - ema_decay)
         
-        train_losses.append(loss.item())
+        train_losses.append(loss_val)
         
         # Update progress bar
-        pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
+        pbar.set_postfix({"Loss": f"{loss_val:.4f}"})
         
         # Logging and save loss curve (only master for XLA)
         if is_master and (iteration + 1) % log_interval == 0:
@@ -385,6 +396,7 @@ def tpu_worker_entry(index, args):
         ema_decay=float(getattr(args, 'ema_decay', 0.999)),
         plot_interval=getattr(args, 'plot_interval', None),
         xla_bf16=bool(getattr(args, 'xla_bf16', False)),
+        grad_accum_steps=int(getattr(args, 'grad_accum_steps', 1)),
     )
 
 
@@ -686,6 +698,7 @@ def main(args):
         ema_decay=float(getattr(args, 'ema_decay', 0.999)),
         plot_interval=getattr(args, 'plot_interval', None),
         xla_bf16=bool(getattr(args, 'xla_bf16', False)),
+        grad_accum_steps=int(getattr(args, 'grad_accum_steps', 1)),
     )
 
     # Cleanup DDP
@@ -759,6 +772,8 @@ if __name__ == "__main__":
                        help="Spawn data-parallel training across TPU cores")
     parser.add_argument("--xla_num_cores", type=int, default=8,
                        help="Number of TPU cores to spawn")
+    parser.add_argument("--grad_accum_steps", type=int, default=1,
+                       help="Gradient accumulation steps per iteration")
     
     # Students can add their own custom arguments below for their implementation
     # For example:
