@@ -315,6 +315,76 @@ def train_model(
     print(f"\nTraining completed! Results saved to: {save_dir}")
     print("Check the training_curves.png for loss visualization.")
 
+def tpu_worker_entry(index, args):
+    import torch_xla.core.xla_model as xm
+    from torch_xla.distributed import parallel_loader as pl
+    device = xm.xla_device()
+    is_master = xm.is_master_ordinal()
+
+    seed_everything(args.seed + index)
+    if is_master:
+        print(f"[TPU worker {index}] Device: {device}")
+
+    excluded_keys = ['device', 'batch_size', 'num_iterations', 'lr', 'save_dir', 'log_interval', 'save_interval', 'seed']
+    model_kwargs = {}
+    for key, value in args.__dict__.items():
+        if key not in excluded_keys and value is not None:
+            model_kwargs[key] = value
+
+    model = create_custom_model(device=device, **model_kwargs)
+    model_config = {
+        'model_type': type(model).__name__,
+        'scheduler_type': type(model.scheduler).__name__,
+        **model_kwargs
+    }
+
+    data_module = SimpsonsDataModule(
+        batch_size=args.batch_size,
+        num_workers=(args.num_workers if args.num_workers is not None else 4),
+    )
+    if bool(getattr(args, 'cache_dataset', False)):
+        try:
+            data_module.train_ds = CachedDataset(data_module.train_ds, pin_memory=False)
+        except Exception:
+            pass
+    world_size = xm.xrt_world_size()
+    rank = xm.get_ordinal()
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        data_module.train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
+    )
+    loader_kwargs = {
+        "pin_memory": False,
+        "persistent_workers": bool(getattr(args, 'persistent_workers', True)),
+        "prefetch_factor": int(getattr(args, 'prefetch_factor', 4)),
+        "shuffle": False,
+        "drop_last": True,
+        "sampler": sampler,
+    }
+    train_loader = torch.utils.data.DataLoader(
+        data_module.train_ds,
+        batch_size=args.batch_size,
+        num_workers=(args.num_workers if args.num_workers is not None else 4),
+        **loader_kwargs,
+    )
+    mp_loader = pl.MpDeviceLoader(train_loader, device)
+    train_iterator = get_data_iterator(mp_loader)
+
+    train_model(
+        model=model,
+        train_iterator=train_iterator,
+        num_iterations=args.num_iterations,
+        lr=args.lr,
+        save_dir=args.save_dir,
+        device=device,
+        log_interval=args.log_interval,
+        save_interval=args.save_interval,
+        model_config=model_config,
+        use_ema=bool(getattr(args, 'use_ema', False)),
+        ema_decay=float(getattr(args, 'ema_decay', 0.999)),
+        plot_interval=getattr(args, 'plot_interval', None),
+        xla_bf16=bool(getattr(args, 'xla_bf16', False)),
+    )
+
 
 def main(args):
     # Set seed for reproducibility
@@ -471,7 +541,7 @@ def main(args):
             os.environ.setdefault('TPU_NUM_DEVICES', nprocs_env)
         except Exception:
             pass
-        xmp.spawn(_tpu_worker, args=(args,), nprocs=None, start_method='fork')
+        xmp.spawn(tpu_worker_entry, args=(args,), nprocs=None, start_method='fork')
         return
 
     # Create model
