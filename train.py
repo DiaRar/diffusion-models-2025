@@ -458,8 +458,12 @@ def main(args):
                 xla_bf16=bool(getattr(args, 'xla_bf16', False)),
             )
 
-        nprocs = int(getattr(args, 'xla_num_cores', 8))
-        xmp.spawn(_tpu_worker, args=(args,), nprocs=nprocs, start_method='fork')
+        nprocs_env = str(getattr(args, 'xla_num_cores', 8))
+        try:
+            os.environ.setdefault('TPU_NUM_DEVICES', nprocs_env)
+        except Exception:
+            pass
+        xmp.spawn(_tpu_worker, args=(args,), nprocs=None, start_method='fork')
         return
 
     # Create model
