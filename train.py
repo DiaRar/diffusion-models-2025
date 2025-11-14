@@ -687,18 +687,3 @@ if __name__ == "__main__":
             args.num_workers = 4
 
     main(args)
-    # Wrap network with DDP if enabled
-    if use_ddp:
-        model.network = torch.nn.parallel.DistributedDataParallel(
-            model.network,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=False,
-        )
-    # DDP flags
-    parser.add_argument("--ddp", action="store_true",
-                       help="Enable DistributedDataParallel on CUDA")
-    parser.add_argument("--local_rank", type=int, default=0,
-                       help="Local rank for torchrun")
-    parser.add_argument("--dist_backend", type=str, default="nccl",
-                       help="Distributed backend (default: nccl)")
