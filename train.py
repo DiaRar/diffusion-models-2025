@@ -414,6 +414,14 @@ def main(args):
                 pass
             device = 'xla'
             print(f"Using XLA device: {device}")
+            try:
+                os.environ.setdefault('KAGGLEHUB_CACHE', './data')
+                import kagglehub
+                ds_root = "./data/datasets/kostastokis/simpsons-faces/versions/1/cropped"
+                if not os.path.exists(ds_root):
+                    kagglehub.dataset_download("kostastokis/simpsons-faces")
+            except Exception:
+                pass
         else:
             try:
                 if bool(getattr(args, 'xla_profile', False)):

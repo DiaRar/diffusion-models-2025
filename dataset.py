@@ -4,7 +4,6 @@ Students can use these utilities to load and preprocess the Simpsons dataset.
 """
 
 import os
-import time
 
 # Set the kagglehub cache directory to ./data
 os.environ["KAGGLEHUB_CACHE"] = "./data"
@@ -91,32 +90,9 @@ class SimpsonsDataModule(object):
 
     def _download_dataset(self, dir_path):
         os.environ["KAGGLEHUB_CACHE"] = "./data"
-        try:
-            import torch_xla.core.xla_model as xm
-            is_xla = True
-        except Exception:
-            xm = None
-            is_xla = False
         if not os.path.exists(dir_path):
-            if is_xla:
-                master = xm.is_master_ordinal()
-                if master:
-                    print("Downloading dataset...")
-                    try:
-                        kagglehub.dataset_download("kostastokis/simpsons-faces")
-                    except FileNotFoundError:
-                        time.sleep(1)
-                        kagglehub.dataset_download("kostastokis/simpsons-faces")
-                try:
-                    xm.rendezvous("dataset_ready")
-                except Exception:
-                    pass
-                wait_until = time.time() + 300
-                while not os.path.exists(dir_path) and time.time() < wait_until:
-                    time.sleep(1)
-            else:
-                print("Downloading dataset...")
-                kagglehub.dataset_download("kostastokis/simpsons-faces")
+            print("Downloading dataset...")
+            kagglehub.dataset_download("kostastokis/simpsons-faces")
         else:
             print("Dataset already downloaded")
 
