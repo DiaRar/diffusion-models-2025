@@ -144,7 +144,7 @@ def train_model(
             if is_xla:
                 loss = model.compute_loss(data, None)
             else:
-                with torch.cuda.amp.autocast(enabled=is_cuda):
+                with torch.amp.autocast('cuda', enabled=is_cuda):
                     loss = model.compute_loss(data, None)
         except NotImplementedError:
             print("Error: compute_loss method not implemented!")
