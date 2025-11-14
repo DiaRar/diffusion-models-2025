@@ -318,9 +318,10 @@ def train_model(
 def tpu_worker_entry(index, args):
     import torch_xla as tx
     import torch_xla.core.xla_model as xm
+    import torch_xla.runtime as xr
     from torch_xla.distributed import parallel_loader as pl
     device = tx.device()
-    is_master = xm.is_master_ordinal()
+    is_master = (xr.global_ordinal() == 0)
 
     seed_everything(args.seed + index)
     if is_master:
@@ -348,8 +349,8 @@ def tpu_worker_entry(index, args):
             data_module.train_ds = CachedDataset(data_module.train_ds, pin_memory=False)
         except Exception:
             pass
-    world_size = xm.xrt_world_size()
-    rank = xm.get_ordinal()
+    world_size = xr.world_size()
+    rank = xr.global_ordinal()
     sampler = torch.utils.data.distributed.DistributedSampler(
         data_module.train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
     )
