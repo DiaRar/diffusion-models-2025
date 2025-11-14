@@ -21,6 +21,24 @@ from src.utils import tensor_to_pil_image, get_current_time, save_model, seed_ev
 from src.base_model import BaseScheduler, BaseGenerativeModel
 from custom_model import create_custom_model
 
+class CachedDataset(torch.utils.data.Dataset):
+    def __init__(self, base_ds, pin_memory=False):
+        self.base_ds = base_ds
+        self.pin_memory = bool(pin_memory)
+        cached = []
+        for i in range(len(base_ds)):
+            item = base_ds[i]
+            if self.pin_memory and isinstance(item, torch.Tensor):
+                item = item.pin_memory()
+            cached.append(item)
+        self._cache = cached
+
+    def __len__(self):
+        return len(self._cache)
+
+    def __getitem__(self, idx):
+        return self._cache[idx]
+
 
 def train_model(
     model,
@@ -35,6 +53,7 @@ def train_model(
     use_ema=False,
     ema_decay=0.999,
     plot_interval=None,
+    xla_bf16=False,
 ):
     """
     Train a generative model.
@@ -100,15 +119,27 @@ def train_model(
     
     model.train()
     
-    pbar = tqdm(range(num_iterations), desc="Training")
-    
-    # Pre-compute device flags
+    # Determine master process for XLA to avoid duplicated I/O
     is_xla = (getattr(device, 'type', '') == 'xla') or ('xla' in str(device))
     is_cuda = str(device) == "cuda"
+    is_master = True
+    if is_xla:
+        try:
+            import torch_xla.core.xla_model as xm
+            is_master = xm.is_master_ordinal()
+        except Exception:
+            is_master = True
+    pbar = tqdm(range(num_iterations), desc="Training") if is_master else range(num_iterations)
+    
     for iteration in pbar:
         # Get batch from infinite iterator
         data = next(train_iterator)
         data = data.contiguous(memory_format=torch.channels_last).to(device, non_blocking=True)
+        if is_xla and xla_bf16:
+            try:
+                data = data.to(torch.bfloat16)
+            except Exception:
+                pass
         try:
             if is_xla:
                 loss = model.compute_loss(data, None)
@@ -126,29 +157,34 @@ def train_model(
         optimizer.zero_grad(set_to_none=True)
         if is_xla:
             import torch_xla.core.xla_model as xm
+            import torch_xla as tx
             loss.backward()
             xm.optimizer_step(optimizer, barrier=True)
-            xm.mark_step()
+            tx.sync()
         else:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         
         if ema_enabled:
-            try:
-                torch._foreach_mul_(ema_params, ema_decay)
-                torch._foreach_add_(ema_params, [p.detach() for p in model.network.parameters()], alpha=1 - ema_decay)
-            except Exception:
+            if is_xla:
                 for ema_p, p in zip(ema_params, model.network.parameters()):
                     ema_p.mul_(ema_decay).add_(p.detach(), alpha=1 - ema_decay)
+            else:
+                try:
+                    torch._foreach_mul_(ema_params, ema_decay)
+                    torch._foreach_add_(ema_params, [p.detach() for p in model.network.parameters()], alpha=1 - ema_decay)
+                except Exception:
+                    for ema_p, p in zip(ema_params, model.network.parameters()):
+                        ema_p.mul_(ema_decay).add_(p.detach(), alpha=1 - ema_decay)
         
         train_losses.append(loss.item())
         
         # Update progress bar
         pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
         
-        # Logging and save loss curve
-        if (iteration + 1) % log_interval == 0:
+        # Logging and save loss curve (only master for XLA)
+        if is_master and (iteration + 1) % log_interval == 0:
             avg_loss = sum(train_losses[-log_interval:]) / min(log_interval, len(train_losses))
             print(f"Iteration {iteration+1}/{num_iterations}, Loss: {loss.item():.4f}, Avg Loss: {avg_loss:.4f}")
 
@@ -190,7 +226,7 @@ def train_model(
                 except Exception as e:
                     print(f"Warning: Could not save training curve: {e}")
         
-        if (iteration + 1) % save_interval == 0:
+        if is_master and (iteration + 1) % save_interval == 0:
             checkpoint_path = save_dir / f"checkpoint_iter_{iteration+1}.pt"
             try:
                 if ema_enabled:
@@ -220,6 +256,11 @@ def train_model(
                     shape,
                     num_inference_timesteps=20
                 )
+                if is_xla and xla_bf16:
+                    try:
+                        samples = samples.to(torch.float32)
+                    except Exception:
+                        pass
             model.train()
             
             # Save samples
@@ -229,9 +270,9 @@ def train_model(
         
     # Save final model
     final_path = save_dir / "final_model.pt"
-    # Ensure a compliant best checkpoint exists even if no log interval triggered
+    # Ensure a compliant best checkpoint exists even if no log interval triggered (master only)
     try:
-        if best_metric == float("inf") and len(train_losses) > 0:
+        if is_master and best_metric == float("inf") and len(train_losses) > 0:
             overall_avg = sum(train_losses) / len(train_losses)
             best_metric = overall_avg
             best_iter = len(train_losses)
@@ -250,7 +291,7 @@ def train_model(
     except Exception as e:
         print(f"Warning: Could not save fallback best model: {e}")
     try:
-        if ema_enabled:
+        if is_master and ema_enabled:
             original = [p.detach().clone() for p in model.network.parameters()]
             for p, ema_p in zip(model.network.parameters(), ema_params):
                 p.data.copy_(ema_p)
@@ -259,13 +300,14 @@ def train_model(
             save_model(model, str(last_ckpt), model_config)
             for p, orig in zip(model.network.parameters(), original):
                 p.data.copy_(orig)
-        else:
+        elif is_master:
             save_model(model, str(final_path), model_config)
             last_ckpt = Path(save_dir) / "last.ckpt"
             save_model(model, str(last_ckpt), model_config)
-        print(f"Final model saved: {final_path}")
-        print(f"Last checkpoint saved: {last_ckpt}")
-        print(f"Config saved: {final_path.parent / 'model_config.json'}")
+        if is_master:
+            print(f"Final model saved: {final_path}")
+            print(f"Last checkpoint saved: {last_ckpt}")
+            print(f"Config saved: {final_path.parent / 'model_config.json'}")
     except Exception as e:
         print(f"Error saving final model: {e}")
     
@@ -291,6 +333,10 @@ def main(args):
     use_tpu = (str(args.device).lower() == "tpu")
     if use_tpu:
         try:
+            # XLA runtime flags
+            if bool(getattr(args, 'xla_profile', False)):
+                os.environ.setdefault('XLA_FLAGS', '--xla_hlo_profile')
+            use_mp_loader = bool(getattr(args, 'xla_use_mp_device_loader', True))
             import torch_xla as tx
             device = tx.device()
         except Exception:
@@ -315,6 +361,95 @@ def main(args):
         except Exception:
             pass
     
+    # XLA multi-core spawn (aggressive TPU data-parallel)
+    if use_tpu and bool(getattr(args, 'xla_spawn', False)):
+        try:
+            import torch_xla.core.xla_model as xm
+            import torch_xla.distributed.xla_multiprocessing as xmp
+        except Exception as e:
+            print(f"XLA spawn requested but torch_xla is unavailable: {e}")
+            return
+
+        def _tpu_worker(index, args):
+            # Device
+            import torch_xla.core.xla_model as xm
+            from torch_xla.distributed import parallel_loader as pl
+            device = xm.xla_device()
+            is_master = xm.is_master_ordinal()
+
+            # Seed
+            seed_everything(args.seed + index)
+            if is_master:
+                print(f"[TPU worker {index}] Device: {device}")
+
+            # Build model kwargs
+            excluded_keys = ['device', 'batch_size', 'num_iterations', 'lr', 'save_dir', 'log_interval', 'save_interval', 'seed']
+            model_kwargs = {}
+            for key, value in args.__dict__.items():
+                if key not in excluded_keys and value is not None:
+                    model_kwargs[key] = value
+
+            # Create model
+            model = create_custom_model(device=device, **model_kwargs)
+            model_config = {
+                'model_type': type(model).__name__,
+                'scheduler_type': type(model.scheduler).__name__,
+                **model_kwargs
+            }
+
+            # Dataset and distributed sampler
+            data_module = SimpsonsDataModule(
+                batch_size=args.batch_size,
+                num_workers=(args.num_workers if args.num_workers is not None else 4),
+            )
+            if bool(getattr(args, 'cache_dataset', False)):
+                try:
+                    data_module.train_ds = CachedDataset(data_module.train_ds, pin_memory=False)
+                except Exception:
+                    pass
+            world_size = xm.xrt_world_size()
+            rank = xm.get_ordinal()
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                data_module.train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
+            )
+            loader_kwargs = {
+                "pin_memory": False,
+                "persistent_workers": bool(getattr(args, 'persistent_workers', True)),
+                "prefetch_factor": int(getattr(args, 'prefetch_factor', 4)),
+                "shuffle": False,
+                "drop_last": True,
+                "sampler": sampler,
+            }
+            train_loader = torch.utils.data.DataLoader(
+                data_module.train_ds,
+                batch_size=args.batch_size,
+                num_workers=(args.num_workers if args.num_workers is not None else 4),
+                **loader_kwargs,
+            )
+            mp_loader = pl.MpDeviceLoader(train_loader, device)
+            train_iterator = get_data_iterator(mp_loader)
+
+            # Train
+            train_model(
+                model=model,
+                train_iterator=train_iterator,
+                num_iterations=args.num_iterations,
+                lr=args.lr,
+                save_dir=args.save_dir,
+                device=device,
+                log_interval=args.log_interval,
+                save_interval=args.save_interval,
+                model_config=model_config,
+                use_ema=bool(getattr(args, 'use_ema', False)),
+                ema_decay=float(getattr(args, 'ema_decay', 0.999)),
+                plot_interval=getattr(args, 'plot_interval', None),
+                xla_bf16=bool(getattr(args, 'xla_bf16', False)),
+            )
+
+        nprocs = int(getattr(args, 'xla_num_cores', 8))
+        xmp.spawn(_tpu_worker, args=(args,), nprocs=nprocs, start_method='fork')
+        return
+
     # Create model
     print("Creating model...")
 
@@ -362,15 +497,23 @@ def main(args):
     except Exception:
         pass
 
+    # TPU: keep model in float32 for compatibility with provided TimeEmbedding
+
     # Load dataset
     print("Loading dataset...")
     try:
         data_module = SimpsonsDataModule(
             batch_size=args.batch_size,
             num_workers=(args.num_workers if args.num_workers is not None else 4),
-            cache=bool(getattr(args, 'cache_dataset', False)),
-            pin_memory_cache=bool(getattr(args, 'pin_memory', True) and str(device) == "cuda")
         )
+        if bool(getattr(args, 'cache_dataset', False)):
+            try:
+                data_module.train_ds = CachedDataset(
+                    data_module.train_ds,
+                    pin_memory=(False if use_tpu else bool(getattr(args, 'pin_memory', True)))
+                )
+            except Exception:
+                pass
         
         base_loader = data_module.train_dataloader()
         try:
@@ -390,10 +533,16 @@ def main(args):
         except Exception:
             train_loader = base_loader
         if use_tpu:
-            import torch_xla.distributed.parallel_loader as pl
-            ploader = pl.ParallelLoader(train_loader, [device])
-            per_dev_loader = ploader.per_device_loader(device)
-            train_iterator = get_data_iterator(per_dev_loader)
+            try:
+                # Prefer modern MpDeviceLoader for XLA
+                from torch_xla.distributed import parallel_loader as pl
+                mp_loader = pl.MpDeviceLoader(train_loader, device)
+                train_iterator = get_data_iterator(mp_loader)
+            except Exception:
+                import torch_xla.distributed.parallel_loader as pl
+                ploader = pl.ParallelLoader(train_loader, [device])
+                per_dev_loader = ploader.per_device_loader(device)
+                train_iterator = get_data_iterator(per_dev_loader)
         else:
             train_iterator = get_data_iterator(train_loader)
         
@@ -416,6 +565,7 @@ def main(args):
         use_ema=bool(getattr(args, 'use_ema', False)),
         ema_decay=float(getattr(args, 'ema_decay', 0.999)),
         plot_interval=getattr(args, 'plot_interval', None),
+        xla_bf16=bool(getattr(args, 'xla_bf16', False)),
     )
 
 
@@ -472,6 +622,17 @@ if __name__ == "__main__":
                        help="Cache and pre-transform dataset in memory for speed")
     parser.add_argument("--plot_interval", type=int, default=None,
                        help="Iterations between plotting loss curve (default: save_interval)")
+    # TPU/XLA performance flags
+    parser.add_argument("--xla_bf16", action="store_true",
+                       help="Use bfloat16 training on XLA for speed")
+    parser.add_argument("--xla_use_mp_device_loader", action="store_true",
+                       help="Use MpDeviceLoader for TPU dataloading")
+    parser.add_argument("--xla_profile", action="store_true",
+                       help="Enable XLA HLO performance profiling")
+    parser.add_argument("--xla_spawn", action="store_true",
+                       help="Spawn data-parallel training across TPU cores")
+    parser.add_argument("--xla_num_cores", type=int, default=8,
+                       help="Number of TPU cores to spawn")
     
     # Students can add their own custom arguments below for their implementation
     # For example:

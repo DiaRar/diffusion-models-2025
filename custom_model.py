@@ -8,6 +8,7 @@ Students need to implement the TODO sections in their own files.
 """
 
 import torch
+import math
 import torch.nn.functional as F
 from src.base_model import BaseScheduler, BaseGenerativeModel
 from src.network import UNet
@@ -139,6 +140,7 @@ class CustomGenerativeModel(BaseGenerativeModel):
         device = data.device
         # Sample time and noise
         t = self.scheduler.sample_timesteps(B, device)
+        t = t.to(data.dtype)
         eps = torch.randn_like(data)
         # Forward process and velocity target
         xt = self.scheduler.forward_process(data, eps, t)
@@ -204,8 +206,8 @@ class CustomGenerativeModel(BaseGenerativeModel):
 
         def heun_step(x_in, t_i, t_j):
             # One Heun step across [t_i -> t_j]
-            t_i_tensor = torch.full((B,), float(t_i), device=device)
-            t_j_tensor = torch.full((B,), float(t_j), device=device)
+            t_i_tensor = torch.full((B,), float(t_i), device=device, dtype=x_in.dtype)
+            t_j_tensor = torch.full((B,), float(t_j), device=device, dtype=x_in.dtype)
             k1 = self.predict(x_in, t_i_tensor)
             x_euler = self.scheduler.reverse_process_step(x_in, k1, t_i_tensor, t_j_tensor)
             k2 = self.predict(x_euler, t_j_tensor)
@@ -215,8 +217,8 @@ class CustomGenerativeModel(BaseGenerativeModel):
 
         if num_inference_timesteps == 1:
             # Single Euler step 1 -> 0
-            t_i = torch.ones(B, device=device)
-            t_j = torch.zeros(B, device=device)
+            t_i = torch.ones(B, device=device, dtype=x.dtype)
+            t_j = torch.zeros(B, device=device, dtype=x.dtype)
             k1 = self.predict(x, t_i)
             x = self.scheduler.reverse_process_step(x, k1, t_i, t_j)
             if return_traj:
@@ -236,10 +238,10 @@ class CustomGenerativeModel(BaseGenerativeModel):
                 traj.append(x.clone())
         else:
             # Default: Euler with uniform grid matching NFE
-            t_grid = torch.linspace(1.0, 0.0, steps=num_inference_timesteps + 1, device=device)
+            t_grid = torch.linspace(1.0, 0.0, steps=num_inference_timesteps + 1, device=device, dtype=x.dtype)
             for i in range(num_inference_timesteps):
-                t_i = torch.full((B,), float(t_grid[i].item()), device=device)
-                t_j = torch.full((B,), float(t_grid[i+1].item()), device=device)
+                t_i = torch.full((B,), float(t_grid[i].item()), device=device, dtype=x.dtype)
+                t_j = torch.full((B,), float(t_grid[i+1].item()), device=device, dtype=x.dtype)
                 k1 = self.predict(x, t_i)
                 x = self.scheduler.reverse_process_step(x, k1, t_i, t_j)
                 if return_traj:
@@ -287,9 +289,31 @@ def create_custom_model(device="cpu", **kwargs):
     
     # Create your model
     compile_flag = bool(kwargs.get('compile', False))
-    if compile_flag:
+    device_str = str(device)
+    if compile_flag and device_str == "cuda":
         try:
             network = torch.compile(network, backend="inductor", mode="max-autotune", fullgraph=True)
+        except Exception:
+            pass
+    # Optional: BF16 wrapper for TPU with TimeEmbedding dtype harmonization
+    use_bf16_xla = (bool(kwargs.get('xla_bf16', False)) or bool(kwargs.get('bf16', False))) and ('xla' in str(device))
+    if use_bf16_xla:
+        try:
+            network = network.to(torch.bfloat16)
+            def _patch_time_embedding(te_module):
+                orig = te_module.forward
+                def new_forward(t):
+                    if t.ndim == 0:
+                        t = t.unsqueeze(-1)
+                    t_freq = te_module.timestep_embedding(t, te_module.frequency_embedding_size)
+                    desired_dtype = te_module.mlp[0].weight.dtype
+                    t_freq = t_freq.to(desired_dtype)
+                    t_emb = te_module.mlp(t_freq)
+                    return t_emb
+                te_module.forward = new_forward
+            _patch_time_embedding(network.time_embedding)
+            if getattr(network, 'use_additional_condition', False) and hasattr(network, 'condition_embedding'):
+                _patch_time_embedding(network.condition_embedding)
         except Exception:
             pass
     model = CustomGenerativeModel(network, scheduler, **kwargs)
