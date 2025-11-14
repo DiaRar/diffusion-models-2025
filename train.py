@@ -562,7 +562,7 @@ def main(args):
             os.environ.setdefault('TPU_NUM_DEVICES', nprocs_env)
         except Exception:
             pass
-        xmp.spawn(tpu_worker_entry, args=(args,), nprocs=None, start_method='fork')
+        xmp.spawn(tpu_worker_entry, args=(args,), nprocs=None, start_method='spawn')
         return
 
     # Create model
