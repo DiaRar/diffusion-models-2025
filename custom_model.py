@@ -292,7 +292,15 @@ def create_custom_model(device="cpu", **kwargs):
     device_str = str(device)
     if compile_flag and device_str == "cuda":
         try:
-            network = torch.compile(network, backend="inductor", mode="max-autotune", fullgraph=True)
+            compile_mode = kwargs.get('compile_mode', None)
+            if compile_mode is None:
+                try:
+                    props = torch.cuda.get_device_properties(0)
+                    sm_count = int(getattr(props, 'multi_processor_count', 0))
+                    compile_mode = "default" if sm_count < 80 else "max-autotune"
+                except Exception:
+                    compile_mode = "default"
+            network = torch.compile(network, backend="inductor", mode=compile_mode, fullgraph=True)
         except Exception:
             pass
     # Optional: BF16 wrapper for TPU with TimeEmbedding dtype harmonization

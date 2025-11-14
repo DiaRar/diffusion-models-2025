@@ -14,6 +14,7 @@ import os
 import time
 import warnings
 from tqdm import tqdm
+import torch.distributed as dist
 
 from src.network import UNet
 from dataset import SimpsonsDataModule, get_data_iterator
@@ -331,6 +332,8 @@ def main(args):
         pass
     # Set device (TPU-first logic to avoid redundant CPU print)
     use_tpu = (str(args.device).lower() == "tpu")
+    use_ddp = bool(getattr(args, 'ddp', False)) and (str(args.device).lower() == 'cuda')
+    local_rank = int(os.environ.get('LOCAL_RANK', getattr(args, 'local_rank', 0)))
     if use_tpu:
         try:
             # XLA runtime flags
@@ -348,8 +351,17 @@ def main(args):
                 return
         print(f"Using XLA device: {device}")
     else:
-        device = torch.device(args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
-        print(f"Using device: {device}")
+        if use_ddp and torch.cuda.is_available():
+            if not dist.is_initialized():
+                backend = getattr(args, 'dist_backend', 'nccl')
+                dist.init_process_group(backend=backend)
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
+            if dist.get_rank() == 0:
+                print(f"Using device: {device}")
+        else:
+            device = torch.device(args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
+            print(f"Using device: {device}")
         try:
             if str(device) == "cuda":
                 import torch.backends.cuda as cuda_backends
@@ -517,12 +529,22 @@ def main(args):
         
         base_loader = data_module.train_dataloader()
         try:
+            sampler = None
+            if use_ddp:
+                sampler = torch.utils.data.distributed.DistributedSampler(
+                    data_module.train_ds,
+                    num_replicas=dist.get_world_size(),
+                    rank=dist.get_rank(),
+                    shuffle=True,
+                    drop_last=True,
+                )
             loader_kwargs = {
                 "pin_memory": (False if use_tpu else bool(getattr(args, 'pin_memory', True))),
                 "persistent_workers": bool(getattr(args, 'persistent_workers', True)),
                 "prefetch_factor": int(getattr(args, 'prefetch_factor', 4)),
-                "shuffle": True,
+                "shuffle": (False if sampler is not None else True),
                 "drop_last": True,
+                "sampler": sampler,
             }
             train_loader = torch.utils.data.DataLoader(
                 data_module.train_ds,
@@ -552,6 +574,12 @@ def main(args):
         return
     
     # Train model
+    # Determine master for logging/saving
+    if use_ddp:
+        is_master = (dist.get_rank() == 0)
+    else:
+        is_master = True
+
     train_model(
         model=model,
         train_iterator=train_iterator,
@@ -567,6 +595,10 @@ def main(args):
         plot_interval=getattr(args, 'plot_interval', None),
         xla_bf16=bool(getattr(args, 'xla_bf16', False)),
     )
+
+    # Cleanup DDP
+    if use_ddp and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -610,6 +642,8 @@ if __name__ == "__main__":
                        help="Compile model with torch.compile for speed")
     parser.add_argument("--channels_last", action="store_true", default=True,
                        help="Use channels_last memory format on CUDA")
+    parser.add_argument("--compile_mode", type=str, choices=["default","reduce-overhead","max-autotune"], default=None,
+                       help="torch.compile mode for CUDA GPUs (auto if omitted)")
     parser.add_argument("--num_workers", type=int, default=None,
                        help="Number of DataLoader workers (default: CPU count)")
     parser.add_argument("--prefetch_factor", type=int, default=4,
@@ -649,3 +683,18 @@ if __name__ == "__main__":
             args.num_workers = 4
 
     main(args)
+    # Wrap network with DDP if enabled
+    if use_ddp:
+        model.network = torch.nn.parallel.DistributedDataParallel(
+            model.network,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+        )
+    # DDP flags
+    parser.add_argument("--ddp", action="store_true",
+                       help="Enable DistributedDataParallel on CUDA")
+    parser.add_argument("--local_rank", type=int, default=0,
+                       help="Local rank for torchrun")
+    parser.add_argument("--dist_backend", type=str, default="nccl",
+                       help="Distributed backend (default: nccl)")
