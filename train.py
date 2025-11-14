@@ -12,6 +12,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import os
 import time
+import warnings
 from tqdm import tqdm
 
 from src.network import UNet
@@ -61,7 +62,11 @@ def train_model(
             optimizer = optim.AdamW(model.network.parameters(), lr=lr)
     else:
         optimizer = optim.Adam(model.network.parameters(), lr=lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=str(device) == "cuda")
+    try:
+        from torch.amp import GradScaler as _GradScaler
+        scaler = _GradScaler('cuda', enabled=str(device) == "cuda")
+    except Exception:
+        scaler = torch.cuda.amp.GradScaler(enabled=str(device) == "cuda")
     ema_enabled = bool(use_ema)
     ema_params = None
     if ema_enabled:
@@ -266,28 +271,38 @@ def main(args):
     if args.save_dir == "./results":
         args.save_dir = f"./results/{get_current_time()}"
     
-    # Set device
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    use_tpu = False
-    if str(args.device).lower() == "tpu":
-        try:
-            import torch_xla.core.xla_model as xm
-            use_tpu = True
-            device = xm.xla_device()
-            print(f"Using XLA device: {device}")
-        except Exception as e:
-            print(f"TPU requested but torch_xla is unavailable: {e}")
-            return
+    # Reduce noisy warnings from third-party libraries
     try:
-        import torch.backends.cuda as cuda_backends
-        cuda_backends.matmul.allow_tf32 = True
-        import torch.backends.cudnn as cudnn
-        cudnn.allow_tf32 = True
-        cudnn.benchmark = True
-        torch.set_float32_matmul_precision('high')
+        warnings.filterwarnings("ignore", message=".*invalid escape sequence.*", category=SyntaxWarning)
     except Exception:
         pass
+    # Set device (TPU-first logic to avoid redundant CPU print)
+    use_tpu = (str(args.device).lower() == "tpu")
+    if use_tpu:
+        try:
+            import torch_xla as tx
+            device = tx.device()
+        except Exception:
+            try:
+                import torch_xla.core.xla_model as xm
+                device = xm.xla_device()
+            except Exception as e:
+                print(f"TPU requested but torch_xla is unavailable: {e}")
+                return
+        print(f"Using XLA device: {device}")
+    else:
+        device = torch.device(args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
+        print(f"Using device: {device}")
+        try:
+            if str(device) == "cuda":
+                import torch.backends.cuda as cuda_backends
+                cuda_backends.matmul.allow_tf32 = True
+                import torch.backends.cudnn as cudnn
+                cudnn.allow_tf32 = True
+                cudnn.benchmark = True
+                torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
     
     # Create model
     print("Creating model...")
@@ -337,7 +352,7 @@ def main(args):
         
         base_loader = data_module.train_dataloader()
         try:
-            loader_kwargs = {"pin_memory": True, "persistent_workers": True, "prefetch_factor": 4, "shuffle": True, "drop_last": True}
+            loader_kwargs = {"pin_memory": (False if use_tpu else True), "persistent_workers": True, "prefetch_factor": 4, "shuffle": True, "drop_last": True}
             train_loader = torch.utils.data.DataLoader(data_module.train_ds, batch_size=args.batch_size, num_workers=4, **loader_kwargs)
         except Exception:
             train_loader = base_loader
