@@ -335,21 +335,29 @@ def main(args):
     use_ddp = bool(getattr(args, 'ddp', False)) and (str(args.device).lower() == 'cuda')
     local_rank = int(os.environ.get('LOCAL_RANK', getattr(args, 'local_rank', 0)))
     if use_tpu:
-        try:
-            # XLA runtime flags
-            if bool(getattr(args, 'xla_profile', False)):
-                os.environ.setdefault('XLA_FLAGS', '--xla_hlo_profile')
-            use_mp_loader = bool(getattr(args, 'xla_use_mp_device_loader', True))
-            import torch_xla as tx
-            device = tx.device()
-        except Exception:
+        if bool(getattr(args, 'xla_spawn', False)):
             try:
-                import torch_xla.core.xla_model as xm
-                device = xm.xla_device()
-            except Exception as e:
-                print(f"TPU requested but torch_xla is unavailable: {e}")
-                return
-        print(f"Using XLA device: {device}")
+                if bool(getattr(args, 'xla_profile', False)):
+                    os.environ.setdefault('XLA_FLAGS', '--xla_hlo_profile')
+            except Exception:
+                pass
+            device = 'xla'
+            print(f"Using XLA device: {device}")
+        else:
+            try:
+                if bool(getattr(args, 'xla_profile', False)):
+                    os.environ.setdefault('XLA_FLAGS', '--xla_hlo_profile')
+                use_mp_loader = bool(getattr(args, 'xla_use_mp_device_loader', True))
+                import torch_xla as tx
+                device = tx.device()
+            except Exception:
+                try:
+                    import torch_xla.core.xla_model as xm
+                    device = xm.xla_device()
+                except Exception as e:
+                    print(f"TPU requested but torch_xla is unavailable: {e}")
+                    return
+            print(f"Using XLA device: {device}")
     else:
         if use_ddp and torch.cuda.is_available():
             if not dist.is_initialized():
