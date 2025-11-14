@@ -562,7 +562,16 @@ def main(args):
             os.environ.setdefault('TPU_NUM_DEVICES', nprocs_env)
         except Exception:
             pass
-        xmp.spawn(tpu_worker_entry, args=(args,), nprocs=None, start_method='spawn')
+        nprocs = int(getattr(args, 'xla_num_cores', 8))
+        try:
+            xmp.spawn(tpu_worker_entry, args=(args,), nprocs=nprocs, start_method='spawn')
+        except Exception as e:
+            print(f"XLA spawn failed with 'spawn': {e}")
+            try:
+                xmp.spawn(tpu_worker_entry, args=(args,), nprocs=nprocs, start_method='fork')
+            except Exception as e2:
+                print(f"XLA spawn failed with 'fork': {e2}")
+                return
         return
 
     # Create model
