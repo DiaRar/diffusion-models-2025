@@ -316,9 +316,10 @@ def train_model(
     print("Check the training_curves.png for loss visualization.")
 
 def tpu_worker_entry(index, args):
+    import torch_xla as tx
     import torch_xla.core.xla_model as xm
     from torch_xla.distributed import parallel_loader as pl
-    device = xm.xla_device()
+    device = tx.device()
     is_master = xm.is_master_ordinal()
 
     seed_everything(args.seed + index)
