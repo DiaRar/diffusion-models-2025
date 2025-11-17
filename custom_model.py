@@ -115,6 +115,8 @@ class CustomGenerativeModel(BaseGenerativeModel):
         self.lpips_weight = float(kwargs.get("lpips_weight", 0.0))
         self._lpips_net = None
         self.use_checkpoint = bool(kwargs.get("use_checkpoint", False))
+        self.use_min_snr = bool(kwargs.get("use_min_snr", False))
+        self.min_snr_gamma = float(kwargs.get("min_snr_gamma", 5.0))
         if self.use_lpips and self.lpips_weight > 0:
             try:
                 import lpips  # type: ignore
@@ -149,7 +151,13 @@ class CustomGenerativeModel(BaseGenerativeModel):
         # Predict velocity
         pred_v = self.predict(xt, t)
         pred_v = pred_v.contiguous(memory_format=torch.channels_last)
-        vel_loss = F.mse_loss(pred_v, target_v)
+        loss = F.mse_loss(pred_v, target_v, reduction="none")
+        loss = loss.mean(dim=[1, 2, 3])
+        if self.use_min_snr:
+            snr = ((1.0 - t) ** 2) / (t ** 2 + 1e-8)
+            min_snr = torch.clamp(snr, max=self.min_snr_gamma)
+            loss = loss * min_snr
+        vel_loss = loss.mean()
 
         # Optional LPIPS on reconstructed x0
         total_loss = vel_loss

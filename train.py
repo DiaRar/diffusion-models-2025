@@ -83,7 +83,7 @@ def train_model(
         except Exception:
             optimizer = optim.AdamW(model.network.parameters(), lr=lr)
     else:
-        optimizer = optim.Adam(model.network.parameters(), lr=lr)
+        optimizer = optim.AdamW(model.network.parameters(), lr=lr)
     try:
         from torch.amp import GradScaler as _GradScaler
         scaler = _GradScaler('cuda', enabled=str(device) == "cuda")
@@ -137,7 +137,9 @@ def train_model(
         optimizer.zero_grad(set_to_none=True)
         # Get batch from infinite iterator
         data = next(train_iterator)
-        data = data.contiguous(memory_format=torch.channels_last).to(device, non_blocking=True)
+        if bool((model_config or {}).get("channels_last", False)):
+            data = data.to(memory_format=torch.channels_last)
+        data = data.to(device, non_blocking=True)
         if is_xla and xla_bf16:
             try:
                 data = data.to(torch.bfloat16)
@@ -750,6 +752,10 @@ if __name__ == "__main__":
                        help="Enable EMA for model parameters")
     parser.add_argument("--ema_decay", type=float, default=0.999,
                        help="EMA decay factor")
+    parser.add_argument("--use_min_snr", action="store_true",
+                       help="Use Min-SNR loss weighting")
+    parser.add_argument("--min_snr_gamma", type=float, default=5.0,
+                       help="Gamma for Min-SNR weighting (default: 5.0)")
     # Performance-related toggles
     parser.add_argument("--compile", action="store_true", default=True,
                        help="Compile model with torch.compile for speed")
